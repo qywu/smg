@@ -345,7 +345,7 @@ fn grpc_host(grpc_url: &str) -> String {
 
 /// Host of an arbitrary URL in unbracketed form, for comparison against
 /// [`grpc_host`] (which is also unbracketed). Returns `None` if the URL has no
-/// parseable host, so an unparseable explicit `metrics_url` is rejected rather
+/// parsable host, so an unparsable explicit `metrics_url` is rejected rather
 /// than silently trusted.
 fn url_host(url: &str) -> Option<String> {
     url::Url::parse(url)
