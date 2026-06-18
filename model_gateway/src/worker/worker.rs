@@ -394,6 +394,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().endpoint_url(route)
     }
 
+    /// HTTP `/metrics` scrape endpoint for this worker, if known.
+    fn metrics_url(&self) -> Option<String> {
+        self.metadata().metrics_url()
+    }
+
     /// Check if this worker is DP-aware.
     fn is_dp_aware(&self) -> bool {
         self.metadata().is_dp_aware()
@@ -672,6 +677,31 @@ impl WorkerMetadata {
     /// Compose an endpoint URL for a specific route.
     pub fn endpoint_url(&self, route: &str) -> String {
         format!("{}{}", self.base_url(), route)
+    }
+
+    /// HTTP `/metrics` endpoint for this worker, if known.
+    ///
+    /// HTTP workers expose `/metrics` on their own URL. gRPC workers have no
+    /// HTTP URL, so the scrape endpoint is discovered from `server_args` during
+    /// metadata discovery and stored in labels. Precedence: an explicit
+    /// `metrics_url` label, then a `prometheus_port` label combined with the
+    /// gRPC host. Returns `None` when no endpoint is known (the worker is then
+    /// skipped by the engine-metrics fan-out rather than scraped on a dark port).
+    pub fn metrics_url(&self) -> Option<String> {
+        match self.spec.connection_mode {
+            ConnectionMode::Http => Some(format!("{}/metrics", self.spec.url)),
+            ConnectionMode::Grpc => self.grpc_metrics_url(),
+        }
+    }
+
+    fn grpc_metrics_url(&self) -> Option<String> {
+        let labels = &self.spec.labels;
+        if let Some(url) = labels.get("metrics_url").filter(|s| !s.is_empty()) {
+            return Some(url.clone());
+        }
+        let port = labels.get("prometheus_port").filter(|s| !s.is_empty())?;
+        let host = &self.spec.bootstrap_host;
+        Some(format!("http://{host}:{port}/metrics"))
     }
 
     // ── DP awareness ────────────────────────────────────────────────

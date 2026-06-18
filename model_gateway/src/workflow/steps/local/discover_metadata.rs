@@ -254,7 +254,73 @@ async fn fetch_grpc_metadata(
     }
 
     normalize_grpc_keys(&mut labels);
+    derive_grpc_metrics_url(&mut labels, &grpc_url);
     Ok((labels, runtime_type.to_string()))
+}
+
+/// Resolve the engine `/metrics` scrape endpoint for a gRPC worker into a
+/// canonical `metrics_url` label, consuming the transient `server_args` keys it
+/// derives from.
+///
+/// Precedence:
+/// 1. explicit `metrics_url`,
+/// 2. `prometheus_port` (+ gRPC host),
+/// 3. derived `http://{host}:{port}/metrics` — only when an `enable_metrics`
+///    flag is truthy, so a dark port is never advertised.
+fn derive_grpc_metrics_url(labels: &mut HashMap<String, String>, grpc_url: &str) {
+    let enable_metrics = labels.remove("enable_metrics");
+    let prometheus_port = labels.remove("prometheus_port").filter(|s| !s.is_empty());
+    let host = labels.remove("host").filter(|s| !s.is_empty());
+    let port = labels.remove("port").filter(|s| !s.is_empty());
+
+    let explicit = labels.get("metrics_url").filter(|s| !s.is_empty()).cloned();
+
+    let resolved = explicit
+        .or_else(|| {
+            prometheus_port.map(|p| {
+                let h = host.clone().unwrap_or_else(|| grpc_host(grpc_url));
+                format!("http://{h}:{p}/metrics")
+            })
+        })
+        .or_else(|| {
+            (is_truthy(enable_metrics.as_deref()) && port.is_some()).then(|| {
+                let h = host.unwrap_or_else(|| grpc_host(grpc_url));
+                let p = port.unwrap_or_default();
+                format!("http://{h}:{p}/metrics")
+            })
+        });
+
+    match resolved {
+        Some(url) => {
+            labels.insert("metrics_url".to_string(), url);
+        }
+        None => {
+            labels.remove("metrics_url");
+        }
+    }
+}
+
+/// Truthy flag values as emitted by `server_args` (bools become `"true"`, ints
+/// like a port number become e.g. `"1"`).
+fn is_truthy(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("true" | "1" | "yes" | "on")
+    )
+}
+
+/// Host portion of a gRPC URL (`grpc://host:port` → `host`), falling back to the
+/// stripped input.
+fn grpc_host(grpc_url: &str) -> String {
+    let stripped = grpc_url
+        .strip_prefix("grpc://")
+        .or_else(|| grpc_url.strip_prefix("grpcs://"))
+        .unwrap_or(grpc_url);
+    stripped
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(stripped)
+        .to_string()
 }
 
 /// Rename gRPC-specific keys to canonical names and strip transient state.
@@ -458,6 +524,81 @@ mod tests {
             labels.get("max_running_requests").map(String::as_str),
             Some("256")
         );
+    }
+
+    fn labels_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn derive_grpc_metrics_url_prefers_explicit() {
+        let mut labels = labels_of(&[
+            ("metrics_url", "http://sidecar:9000/metrics"),
+            ("prometheus_port", "9100"),
+            ("enable_metrics", "true"),
+        ]);
+        derive_grpc_metrics_url(&mut labels, "grpc://host:30001");
+        assert_eq!(
+            labels.get("metrics_url").map(String::as_str),
+            Some("http://sidecar:9000/metrics")
+        );
+        // Transient derivation keys are consumed.
+        assert!(!labels.contains_key("prometheus_port"));
+        assert!(!labels.contains_key("enable_metrics"));
+    }
+
+    #[test]
+    fn derive_grpc_metrics_url_from_prometheus_port() {
+        let mut labels = labels_of(&[("prometheus_port", "9100")]);
+        derive_grpc_metrics_url(&mut labels, "grpc://10.0.0.5:30001");
+        assert_eq!(
+            labels.get("metrics_url").map(String::as_str),
+            Some("http://10.0.0.5:9100/metrics")
+        );
+    }
+
+    #[test]
+    fn derive_grpc_metrics_url_derives_when_enabled() {
+        let mut labels = labels_of(&[
+            ("enable_metrics", "true"),
+            ("host", "0.0.0.0"),
+            ("port", "30000"),
+        ]);
+        derive_grpc_metrics_url(&mut labels, "grpc://host:30001");
+        assert_eq!(
+            labels.get("metrics_url").map(String::as_str),
+            Some("http://0.0.0.0:30000/metrics")
+        );
+    }
+
+    #[test]
+    fn derive_grpc_metrics_url_uses_grpc_host_when_host_absent() {
+        let mut labels = labels_of(&[("enable_metrics", "true"), ("port", "30000")]);
+        derive_grpc_metrics_url(&mut labels, "grpc://node-7:30001");
+        assert_eq!(
+            labels.get("metrics_url").map(String::as_str),
+            Some("http://node-7:30000/metrics")
+        );
+    }
+
+    #[test]
+    fn derive_grpc_metrics_url_skips_when_disabled() {
+        // enable_metrics absent/falsy and no explicit port keys: never advertise
+        // a dark scrape endpoint.
+        let mut labels = labels_of(&[("host", "0.0.0.0"), ("port", "30000")]);
+        derive_grpc_metrics_url(&mut labels, "grpc://host:30001");
+        assert!(!labels.contains_key("metrics_url"));
+
+        let mut labels = labels_of(&[
+            ("enable_metrics", "false"),
+            ("host", "0.0.0.0"),
+            ("port", "30000"),
+        ]);
+        derive_grpc_metrics_url(&mut labels, "grpc://host:30001");
+        assert!(!labels.contains_key("metrics_url"));
     }
 
     #[test]
