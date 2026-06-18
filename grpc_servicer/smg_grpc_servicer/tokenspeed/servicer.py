@@ -104,11 +104,15 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         server_args: ServerArgs,
         scheduler_info: dict,
         health_servicer: TokenSpeedHealthServicer | None = None,
+        metrics_port: int | None = None,
     ):
         self.async_llm = async_llm
         self.server_args = server_args
         self.scheduler_info = scheduler_info
         self.health_servicer = health_servicer
+        # Advertised in GetServerInfo.server_args so the gateway can scrape the
+        # Prometheus sidecar; ``None`` when the sidecar is disabled.
+        self.metrics_port = metrics_port
         self.start_time = time.time()
 
         # Drive AsyncLLM's output-dispatch loop. This is idempotent — the
@@ -424,6 +428,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             server_args_dict = dataclasses.asdict(self.server_args)
         else:
             server_args_dict = dict(getattr(self.server_args, "__dict__", {}))
+        server_args_dict.update(self._metrics_server_args())
         server_args_struct = Struct()
         server_args_struct.update(_make_json_serializable(server_args_dict))
 
@@ -451,6 +456,33 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             start_time=start_timestamp,
             max_total_num_tokens=int(self.scheduler_info.get("max_total_num_tokens", 0)),
         )
+
+    def _metrics_server_args(self) -> dict[str, Any]:
+        """Sidecar address advertised in ``server_args`` for gateway discovery."""
+        from smg_grpc_servicer.metrics import metrics_server_args
+
+        return metrics_server_args(getattr(self.server_args, "host", "") or "", self.metrics_port)
+
+    def load_snapshot(self) -> dict[str, float]:
+        """Sync, non-blocking load snapshot for the Prometheus sidecar.
+
+        Mirrors the running/waiting/token-usage shape ``GetLoads`` reports, but
+        reads only in-process ``AsyncLLM`` state (no scheduler ZMQ round-trip) so
+        it is safe to call from a synchronous Prometheus collect().
+        """
+        rid_to_state = getattr(self.async_llm, "rid_to_state", {}) or {}
+        running = 0
+        for state in rid_to_state.values():
+            if getattr(state, "finished", False):
+                continue
+            running += 1
+        waiting = max(0, len(rid_to_state) - running)
+        return {
+            "num_running_reqs": float(running),
+            "num_waiting_reqs": float(waiting),
+            "num_total_reqs": float(len(rid_to_state)),
+            "token_usage": 0.0,
+        }
 
     # ------------------------------------------------------------------
     # GetLoads (unary) — bridges to TokenSpeed's scheduler-side load metrics

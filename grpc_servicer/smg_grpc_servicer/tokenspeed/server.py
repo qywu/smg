@@ -13,10 +13,16 @@ from concurrent import futures
 import grpc
 from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
+from prometheus_client import CollectorRegistry
 from smg_grpc_proto import tokenspeed_scheduler_pb2_grpc
 from smg_grpc_proto.generated import tokenspeed_scheduler_pb2
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
+from smg_grpc_servicer.metrics import (
+    SchedulerLoadCollector,
+    resolve_metrics_port,
+    start_metrics_sidecar,
+)
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.scheduler_launcher import launch_engine
 from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
@@ -75,11 +81,18 @@ def _grpc_server_options(max_message_bytes: int) -> list[tuple[str, int]]:
     ]
 
 
-async def serve_grpc(server_args: ServerArgs) -> None:
-    """Run the TokenSpeed gRPC server until a shutdown signal is received."""
+async def serve_grpc(server_args: ServerArgs, metrics_port: int | None = None) -> None:
+    """Run the TokenSpeed gRPC server until a shutdown signal is received.
+
+    ``metrics_port`` (falling back to ``SMG_METRICS_PORT``) enables a best-effort
+    Prometheus ``/metrics`` sidecar the gateway can scrape; ``None`` disables it.
+    """
 
     logger.info("Launching TokenSpeed scheduler + AsyncLLM...")
     async_llm, scheduler_info = launch_engine(server_args)
+
+    # Resolve before constructing the servicer so GetServerInfo can advertise it.
+    metrics_port = resolve_metrics_port(metrics_port)
 
     max_message_bytes = _grpc_max_message_bytes()
     server = grpc.aio.server(
@@ -98,6 +111,7 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         server_args=server_args,
         scheduler_info=scheduler_info,
         health_servicer=health_servicer,
+        metrics_port=metrics_port,
     )
     tokenspeed_scheduler_pb2_grpc.add_TokenSpeedSchedulerServicer_to_server(servicer, server)
 
@@ -113,6 +127,16 @@ async def serve_grpc(server_args: ServerArgs) -> None:
     logger.info("TokenSpeed gRPC server listening on %s", listen_addr)
 
     await server.start()
+
+    # Best-effort Prometheus sidecar. TokenSpeed has no native registry, so a
+    # SchedulerLoadCollector re-exposes the in-process load the servicer reports.
+    metrics_sidecar = None
+    if metrics_port is not None:
+        registry = CollectorRegistry()
+        registry.register(SchedulerLoadCollector(servicer.load_snapshot))
+        metrics_sidecar = await start_metrics_sidecar(
+            server_args.host, metrics_port, registry=registry
+        )
 
     # Warmup on a background thread so the async server can handle the probe.
     warmup_thread = threading.Thread(
@@ -140,6 +164,8 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         await stop_event.wait()
     finally:
         logger.info("Shutting down TokenSpeed gRPC server")
+        if metrics_sidecar is not None:
+            await metrics_sidecar.close()
         try:
             await servicer.shutdown()
         except Exception:  # noqa: BLE001
