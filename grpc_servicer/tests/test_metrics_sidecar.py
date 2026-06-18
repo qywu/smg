@@ -330,3 +330,50 @@ def test_handle_times_out_slow_request(monkeypatch):
             await sidecar.close()
 
     assert asyncio.run(scenario()) == b""
+
+
+def test_handle_times_out_slow_header_drip(monkeypatch):
+    # Slowloris: a client that drips one header line per interval *shorter* than
+    # the timeout but never finishes the block. A per-line timeout would reset the
+    # clock on every drip and hold the handler open forever; the whole-head-phase
+    # deadline must cut it off regardless of the drip rate.
+    monkeypatch.setattr(metrics_mod, "_READ_TIMEOUT", 0.3)
+
+    async def scenario():
+        sidecar = await start_metrics_sidecar("127.0.0.1", 0, registry=CollectorRegistry())
+        assert sidecar is not None
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", sidecar.port)
+            writer.write(b"GET /metrics HTTP/1.1\r\n")
+            await writer.drain()
+
+            async def drip():
+                # Each drip lands well inside _READ_TIMEOUT (0.3s) yet the total
+                # span (>1s) blows the whole-phase budget; never sends the blank
+                # line that would end the header block.
+                for i in range(10):
+                    await asyncio.sleep(0.15)
+                    writer.write(f"X-Drip-{i}: keep-alive\r\n".encode())
+                    await writer.drain()
+
+            dripper = asyncio.ensure_future(drip())
+            try:
+                # The whole-phase deadline closes the connection: read() returns
+                # EOF far sooner than the dripper would finish (10 * 0.15 = 1.5s).
+                data = await asyncio.wait_for(reader.read(), timeout=1.0)
+            finally:
+                dripper.cancel()
+                try:
+                    await dripper
+                except (asyncio.CancelledError, ConnectionError):
+                    pass
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except ConnectionError:
+                pass
+            return data
+        finally:
+            await sidecar.close()
+
+    assert asyncio.run(scenario()) == b""

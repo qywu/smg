@@ -34,7 +34,8 @@ METRICS_PORT_ENV = "SMG_METRICS_PORT"
 # port for them, but never a wildcard URL.
 _UNROUTABLE_HOSTS = frozenset({"0.0.0.0", "::", "[::]", ""})
 
-# Bound per-request reads so a Slowloris-style client can't pin a handler open.
+# One budget for the whole request-head read (request line + headers) so a
+# Slowloris-style client dripping headers can't pin a handler open.
 _READ_TIMEOUT = 5.0
 
 
@@ -161,22 +162,38 @@ class MetricsSidecar:
                 logger.debug("metrics sidecar wait_closed raised", exc_info=True)
             self._server = None
 
+    @staticmethod
+    async def _read_head(reader: asyncio.StreamReader) -> bytes:
+        """Read the request line + drain headers, returning the request line.
+
+        Reads until the blank line that ends the header block (or EOF). Draining
+        the headers keeps the client's write side from seeing a reset. The caller
+        wraps this in a single ``wait_for`` so the *whole* head-read phase shares
+        one deadline; a per-line timeout would let a Slowloris client reset the
+        clock by dripping one header every interval and hold the handler open.
+        """
+        request_line = await reader.readline()
+        # Empty request line means EOF / immediate disconnect — nothing to serve.
+        if not request_line:
+            return b""
+        while True:
+            line = await reader.readline()
+            if line in (b"\r\n", b"\n", b""):
+                break
+        return request_line
+
     async def _handle(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
         try:
-            request_line = await asyncio.wait_for(reader.readline(), timeout=_READ_TIMEOUT)
+            # One deadline for the entire head read (request line + all headers),
+            # not one per line — see _read_head.
+            request_line = await asyncio.wait_for(self._read_head(reader), timeout=_READ_TIMEOUT)
             # Empty request line means EOF / immediate disconnect — nothing to serve.
             if not request_line:
                 return
-            # Drain headers so the client's write side doesn't see a reset. The
-            # read timeout bounds a Slowloris-style client that never finishes them.
-            while True:
-                line = await asyncio.wait_for(reader.readline(), timeout=_READ_TIMEOUT)
-                if line in (b"\r\n", b"\n", b""):
-                    break
 
             parts = request_line.split()
             method = parts[0] if parts else b""
