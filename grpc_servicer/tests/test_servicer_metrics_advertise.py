@@ -60,6 +60,28 @@ def test_tokenspeed_get_server_info_omits_metrics_when_disabled():
     assert "metrics_url" not in args
 
 
+def test_tokenspeed_load_snapshot_reports_running_only():
+    pytest.importorskip("tokenspeed")
+    from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
+
+    servicer = TokenSpeedSchedulerServicer.__new__(TokenSpeedSchedulerServicer)
+    # Two running + one finished-but-not-cleaned entry: waiting can't be told
+    # apart from running without a scheduler round-trip, so it's reported as 0
+    # and total mirrors running (excludes the finished entry).
+    servicer.async_llm = SimpleNamespace(
+        rid_to_state={
+            "a": SimpleNamespace(finished=False),
+            "b": SimpleNamespace(finished=False),
+            "c": SimpleNamespace(finished=True),
+        }
+    )
+    snap = servicer.load_snapshot()
+    assert snap["num_running_reqs"] == 2.0
+    assert snap["num_waiting_reqs"] == 0.0
+    assert snap["num_total_reqs"] == 2.0
+    assert snap["token_usage"] == 0.0
+
+
 def test_sglang_get_server_info_advertises_metrics():
     pytest.importorskip("sglang")
     from smg_grpc_servicer.sglang.servicer import SGLangSchedulerServicer

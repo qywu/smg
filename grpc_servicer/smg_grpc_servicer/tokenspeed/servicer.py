@@ -469,6 +469,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         Mirrors the running/waiting/token-usage shape ``GetLoads`` reports, but
         reads only in-process ``AsyncLLM`` state (no scheduler ZMQ round-trip) so
         it is safe to call from a synchronous Prometheus collect().
+
+        ``rid_to_state`` retains finished-but-not-yet-cleaned entries and can't
+        distinguish waiting from running without a scheduler round-trip, so
+        (like sglang's ``load_snapshot``) waiting is reported as 0 and total as
+        running only; the scheduler-side breakdown is reported via ``GetLoads``.
         """
         rid_to_state = getattr(self.async_llm, "rid_to_state", {}) or {}
         running = 0
@@ -476,11 +481,10 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             if getattr(state, "finished", False):
                 continue
             running += 1
-        waiting = max(0, len(rid_to_state) - running)
         return {
             "num_running_reqs": float(running),
-            "num_waiting_reqs": float(waiting),
-            "num_total_reqs": float(len(rid_to_state)),
+            "num_waiting_reqs": 0.0,
+            "num_total_reqs": float(running),
             "token_usage": 0.0,
         }
 

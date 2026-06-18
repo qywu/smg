@@ -91,7 +91,8 @@ async def serve_grpc(server_args: ServerArgs, metrics_port: int | None = None) -
     logger.info("Launching TokenSpeed scheduler + AsyncLLM...")
     async_llm, scheduler_info = launch_engine(server_args)
 
-    # Resolve before constructing the servicer so GetServerInfo can advertise it.
+    # Requested port only decides whether to start the sidecar; the servicer
+    # advertises the *bound* port set after a successful start (see below).
     metrics_port = resolve_metrics_port(metrics_port)
 
     max_message_bytes = _grpc_max_message_bytes()
@@ -111,7 +112,8 @@ async def serve_grpc(server_args: ServerArgs, metrics_port: int | None = None) -
         server_args=server_args,
         scheduler_info=scheduler_info,
         health_servicer=health_servicer,
-        metrics_port=metrics_port,
+        # Set to the bound port only after the sidecar starts (below).
+        metrics_port=None,
     )
     tokenspeed_scheduler_pb2_grpc.add_TokenSpeedSchedulerServicer_to_server(servicer, server)
 
@@ -137,6 +139,9 @@ async def serve_grpc(server_args: ServerArgs, metrics_port: int | None = None) -
         metrics_sidecar = await start_metrics_sidecar(
             server_args.host, metrics_port, registry=registry
         )
+        # Advertise only the actually-bound port; leave it None if the bind failed.
+        if metrics_sidecar is not None:
+            servicer.metrics_port = metrics_sidecar.port
 
     # Warmup on a background thread so the async server can handle the probe.
     warmup_thread = threading.Thread(

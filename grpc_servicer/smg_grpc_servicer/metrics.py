@@ -34,28 +34,36 @@ METRICS_PORT_ENV = "SMG_METRICS_PORT"
 # port for them, but never a wildcard URL.
 _UNROUTABLE_HOSTS = frozenset({"0.0.0.0", "::", "[::]", ""})
 
+# Bound per-request reads so a Slowloris-style client can't pin a handler open.
+_READ_TIMEOUT = 5.0
+
+
+def _coerce_port(value: object, source: str) -> int | None:
+    """Coerce ``value`` to a valid ``0 < port < 65536`` int, else log + return None."""
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not an int; metrics sidecar disabled", source, value)
+        return None
+    if not 0 < port < 65536:
+        logger.warning("%s=%d out of range; metrics sidecar disabled", source, port)
+        return None
+    return port
+
 
 def resolve_metrics_port(explicit: int | None = None) -> int | None:
     """Resolve the sidecar port from an explicit value or ``SMG_METRICS_PORT``.
 
-    Returns ``None`` when neither is set (sidecar disabled) or the env value is
-    not a usable port; a malformed env var is logged and treated as unset rather
-    than aborting startup.
+    Returns ``None`` when neither is set (sidecar disabled) or the value is not a
+    usable port. Both the explicit argument and the env var are range-validated;
+    a malformed value is logged and treated as unset rather than aborting startup.
     """
     if explicit is not None:
-        return explicit
+        return _coerce_port(explicit, "metrics_port")
     raw = os.getenv(METRICS_PORT_ENV)
     if not raw:
         return None
-    try:
-        port = int(raw)
-    except ValueError:
-        logger.warning("%s=%r is not an int; metrics sidecar disabled", METRICS_PORT_ENV, raw)
-        return None
-    if not 0 < port < 65536:
-        logger.warning("%s=%d out of range; metrics sidecar disabled", METRICS_PORT_ENV, port)
-        return None
-    return port
+    return _coerce_port(raw, METRICS_PORT_ENV)
 
 
 def metrics_url(host: str, port: int) -> str | None:
@@ -68,6 +76,9 @@ def metrics_url(host: str, port: int) -> str | None:
     """
     if host in _UNROUTABLE_HOSTS:
         return None
+    # Bracket bare IPv6 literals so the URL parses (``http://[::1]:9100/...``).
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
     return f"http://{host}:{port}/metrics"
 
 
@@ -94,15 +105,20 @@ class SchedulerLoadCollector(Collector):
 
     ``snapshot_fn`` returns the same dict shape ``GetLoads`` builds its response
     from: ``num_running_reqs``, ``num_waiting_reqs``, ``num_total_reqs`` and a
-    ``token_usage`` ratio in ``[0, 1]``. It is called on every scrape and must
-    not raise; the sidecar treats a raising collector as "no data".
+    ``token_usage`` ratio in ``[0, 1]``. It is called on every scrape; a raising
+    ``snapshot_fn`` is caught and exposed as an empty snapshot so one failing call
+    doesn't break the whole ``/metrics`` response.
     """
 
     def __init__(self, snapshot_fn: Callable[[], dict[str, float]]):
         self._snapshot_fn = snapshot_fn
 
     def collect(self):
-        snapshot = self._snapshot_fn() or {}
+        try:
+            snapshot = self._snapshot_fn() or {}
+        except Exception:  # noqa: BLE001 — a failing snapshot must not break the scrape.
+            logger.warning("scheduler load snapshot failed; exposing empty", exc_info=True)
+            snapshot = {}
         gauges = (
             ("smg_scheduler_running_requests", "Requests currently running", "num_running_reqs"),
             ("smg_scheduler_waiting_requests", "Requests waiting in queue", "num_waiting_reqs"),
@@ -151,10 +167,14 @@ class MetricsSidecar:
         writer: asyncio.StreamWriter,
     ) -> None:
         try:
-            request_line = await reader.readline()
-            # Drain headers so the client's write side doesn't see a reset.
+            request_line = await asyncio.wait_for(reader.readline(), timeout=_READ_TIMEOUT)
+            # Empty request line means EOF / immediate disconnect — nothing to serve.
+            if not request_line:
+                return
+            # Drain headers so the client's write side doesn't see a reset. The
+            # read timeout bounds a Slowloris-style client that never finishes them.
             while True:
-                line = await reader.readline()
+                line = await asyncio.wait_for(reader.readline(), timeout=_READ_TIMEOUT)
                 if line in (b"\r\n", b"\n", b""):
                     break
 
@@ -174,7 +194,8 @@ class MetricsSidecar:
         finally:
             try:
                 writer.close()
-            except Exception:  # noqa: BLE001
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001 — fully release the socket, best-effort.
                 pass
 
     @staticmethod

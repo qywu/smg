@@ -19,6 +19,7 @@ pytest.importorskip("prometheus_client")
 
 from prometheus_client import CollectorRegistry  # noqa: E402
 from prometheus_client.parser import text_string_to_metric_families  # noqa: E402
+from smg_grpc_servicer import metrics as metrics_mod  # noqa: E402
 from smg_grpc_servicer.metrics import (  # noqa: E402
     METRICS_PORT_ENV,
     SchedulerLoadCollector,
@@ -54,6 +55,14 @@ def test_metrics_url_for_routable_host():
     assert metrics_url("10.1.2.3", 9100) == "http://10.1.2.3:9100/metrics"
 
 
+def test_metrics_url_brackets_ipv6_literal():
+    assert metrics_url("2001:db8::1", 9100) == "http://[2001:db8::1]:9100/metrics"
+
+
+def test_metrics_url_does_not_double_bracket_ipv6():
+    assert metrics_url("[2001:db8::1]", 9100) == "http://[2001:db8::1]:9100/metrics"
+
+
 def test_metrics_server_args_disabled_is_empty():
     assert metrics_server_args("10.1.2.3", None) == {}
 
@@ -70,6 +79,15 @@ def test_metrics_server_args_wildcard_host_advertises_port_only():
 
 def test_resolve_metrics_port_prefers_explicit():
     assert resolve_metrics_port(9100) == 9100
+
+
+@pytest.mark.parametrize("value", [0, 70000, -1])
+def test_resolve_metrics_port_rejects_bad_explicit(monkeypatch, value):
+    # Explicit port is range-validated like the env var (was previously bypassed).
+    # Set the env to a *valid* port to prove the bad explicit value isn't silently
+    # falling through to it.
+    monkeypatch.setenv(METRICS_PORT_ENV, "9300")
+    assert resolve_metrics_port(value) is None
 
 
 def test_resolve_metrics_port_none_without_env(monkeypatch):
@@ -114,6 +132,17 @@ def test_scheduler_load_collector_tolerates_missing_keys():
     registry.register(SchedulerLoadCollector(dict))  # empty snapshot
     assert registry.get_sample_value("smg_scheduler_running_requests") == 0.0
     assert registry.get_sample_value("smg_scheduler_token_usage") == 0.0
+
+
+def test_scheduler_load_collector_tolerates_raising_snapshot():
+    def boom():
+        raise RuntimeError("snapshot unavailable")
+
+    registry = CollectorRegistry()
+    registry.register(SchedulerLoadCollector(boom))
+    # A failing snapshot_fn must not break the scrape: gauges fall back to 0.
+    assert registry.get_sample_value("smg_scheduler_running_requests") == 0.0
+    assert registry.get_sample_value("smg_scheduler_total_requests") == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -221,3 +250,83 @@ def test_close_is_idempotent():
         await sidecar.close()  # second close must not raise
 
     asyncio.run(scenario())
+
+
+def test_advertises_actually_bound_port_not_zero():
+    # Mirrors server.py: started on port 0, the servicer advertises the *bound*
+    # port (sidecar.port), never the requested 0. The advertised host is the
+    # configured server host, independent of the loopback bind used here.
+    async def scenario():
+        sidecar = await start_metrics_sidecar("127.0.0.1", 0, registry=CollectorRegistry())
+        assert sidecar is not None
+        try:
+            return metrics_server_args("10.0.0.5", sidecar.port)
+        finally:
+            await sidecar.close()
+
+    args = asyncio.run(scenario())
+    assert args["metrics_port"] != 0
+    assert args["metrics_url"] == f"http://10.0.0.5:{args['metrics_port']}/metrics"
+
+
+def test_failed_bind_advertises_nothing():
+    # When start returns None, server.py leaves metrics_port None → no advertisement.
+    async def scenario():
+        first = await start_metrics_sidecar("127.0.0.1", 0, registry=CollectorRegistry())
+        assert first is not None
+        try:
+            second = await start_metrics_sidecar(
+                "127.0.0.1", first.port, registry=CollectorRegistry()
+            )
+            advertised_port = second.port if second is not None else None
+            return metrics_server_args("127.0.0.1", advertised_port)
+        finally:
+            await first.close()
+
+    assert asyncio.run(scenario()) == {}
+
+
+def test_handle_returns_on_immediate_disconnect():
+    # EOF before any request line must not hang the handler; the server keeps
+    # serving subsequent connections.
+    async def scenario():
+        sidecar = await start_metrics_sidecar("127.0.0.1", 0, registry=CollectorRegistry())
+        assert sidecar is not None
+        loop = asyncio.get_running_loop()
+        try:
+            # Open and immediately close without sending anything (EOF).
+            reader, writer = await asyncio.open_connection("127.0.0.1", sidecar.port)
+            writer.close()
+            await writer.wait_closed()
+            # A normal request still succeeds afterwards.
+            return await _fetch(loop, f"http://127.0.0.1:{sidecar.port}/metrics")
+        finally:
+            await sidecar.close()
+
+    status, _, _ = asyncio.run(scenario())
+    assert status == 200
+
+
+def test_handle_times_out_slow_request(monkeypatch):
+    # A client that opens a connection but never finishes the request headers
+    # must be dropped by the read timeout rather than pinning the handler open.
+    monkeypatch.setattr(metrics_mod, "_READ_TIMEOUT", 0.2)
+
+    async def scenario():
+        sidecar = await start_metrics_sidecar("127.0.0.1", 0, registry=CollectorRegistry())
+        assert sidecar is not None
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", sidecar.port)
+            # Request line only — never send the blank line that ends headers.
+            writer.write(b"GET /metrics HTTP/1.1\r\n")
+            await writer.drain()
+            # The server's read timeout (0.2s) closes the connection: read() then
+            # returns EOF well within this wait_for, so the handler didn't hang.
+            data = await asyncio.wait_for(reader.read(), timeout=3.0)
+            writer.close()
+            await writer.wait_closed()
+            return data
+        finally:
+            await sidecar.close()
+
+    assert asyncio.run(scenario()) == b""

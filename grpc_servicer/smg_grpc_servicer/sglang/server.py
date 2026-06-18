@@ -164,7 +164,8 @@ async def serve_grpc(
     )
     health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
 
-    # Resolve before constructing the servicer so GetServerInfo can advertise it.
+    # Requested port only decides whether to start the sidecar; the servicer
+    # advertises the *bound* port set after a successful start (see below).
     metrics_port = resolve_metrics_port(metrics_port)
 
     # Add SGLang service
@@ -175,7 +176,8 @@ async def serve_grpc(
         model_info=model_info,
         scheduler_info=scheduler_info,
         health_servicer=health_servicer,
-        metrics_port=metrics_port,
+        # Set to the bound port only after the sidecar starts (below).
+        metrics_port=None,
     )
     sglang_scheduler_pb2_grpc.add_SglangSchedulerServicer_to_server(servicer, server)
 
@@ -316,6 +318,9 @@ async def serve_grpc(
         metrics_sidecar = await start_metrics_sidecar(
             server_args.host, metrics_port, registry=registry
         )
+        # Advertise only the actually-bound port; leave it None if the bind failed.
+        if metrics_sidecar is not None:
+            servicer.metrics_port = metrics_sidecar.port
 
     # Start warmup in a separate thread
     warmup_thread = threading.Thread(
