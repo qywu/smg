@@ -11,7 +11,10 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
-    worker::{sampling_defaults::SamplingDefaults, ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL},
+    worker::{
+        sampling_defaults::SamplingDefaults, worker::metrics_authority, ConnectionMode,
+        DEFAULT_SAMPLING_PARAMS_LABEL,
+    },
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::util::{grpc_base_url, http_base_url},
@@ -263,7 +266,8 @@ async fn fetch_grpc_metadata(
 /// derives from.
 ///
 /// Precedence:
-/// 1. explicit `metrics_url`,
+/// 1. explicit `metrics_url` — but only when its host matches the worker's gRPC
+///    host (see below),
 /// 2. `prometheus_port` (+ gRPC host),
 /// 3. derived `http://{host}:{port}/metrics` — only when an `enable_metrics`
 ///    flag is truthy, so a dark port is never advertised.
@@ -272,26 +276,35 @@ async fn fetch_grpc_metadata(
 /// `host` (which is the bind address — often `0.0.0.0`/`::`/empty — and not a
 /// routable scrape target). This keeps the scrape and its bearer token on the
 /// worker's own host. The `host` key is consumed but not used.
+///
+/// An explicit `metrics_url` is backend-advertised and therefore untrusted; we
+/// accept it only when its host matches the worker's gRPC host so a backend
+/// cannot redirect the scrape (and any attached credentials) to an arbitrary
+/// origin. Scheme and port are not constrained — the metrics port differs from
+/// the gRPC port by design. A mismatching `metrics_url` is dropped and we fall
+/// back to the derived endpoint (or none).
 fn derive_grpc_metrics_url(labels: &mut HashMap<String, String>, grpc_url: &str) {
     let enable_metrics = labels.remove("enable_metrics");
     let prometheus_port = labels.remove("prometheus_port").filter(|s| !s.is_empty());
     labels.remove("host");
     let port = labels.remove("port").filter(|s| !s.is_empty());
 
-    let explicit = labels.get("metrics_url").filter(|s| !s.is_empty()).cloned();
+    let worker_host = grpc_host(grpc_url);
+    let explicit = labels
+        .get("metrics_url")
+        .filter(|s| !s.is_empty())
+        .filter(|url| url_host(url).as_deref() == Some(worker_host.as_str()))
+        .cloned();
 
     let resolved = explicit
         .or_else(|| {
-            prometheus_port.map(|p| {
-                let h = grpc_host(grpc_url);
-                format!("http://{h}:{p}/metrics")
-            })
+            prometheus_port
+                .map(|p| format!("http://{}/metrics", metrics_authority(&worker_host, &p)))
         })
         .or_else(|| {
             (is_truthy(enable_metrics.as_deref()) && port.is_some()).then(|| {
-                let h = grpc_host(grpc_url);
                 let p = port.unwrap_or_default();
-                format!("http://{h}:{p}/metrics")
+                format!("http://{}/metrics", metrics_authority(&worker_host, &p))
             })
         });
 
@@ -328,6 +341,22 @@ fn grpc_host(grpc_url: &str) -> String {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host)
         .to_string()
+}
+
+/// Host of an arbitrary URL in unbracketed form, for comparison against
+/// [`grpc_host`] (which is also unbracketed). Returns `None` if the URL has no
+/// parseable host, so an unparseable explicit `metrics_url` is rejected rather
+/// than silently trusted.
+fn url_host(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .map(|h| {
+            h.strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(&h)
+                .to_string()
+        })
 }
 
 /// Rename gRPC-specific keys to canonical names and strip transient state.
@@ -542,19 +571,45 @@ mod tests {
 
     #[test]
     fn derive_grpc_metrics_url_prefers_explicit() {
+        // Explicit URL on the worker's own host (only the port differs) is
+        // trusted and wins over the derived candidates.
         let mut labels = labels_of(&[
-            ("metrics_url", "http://sidecar:9000/metrics"),
+            ("metrics_url", "http://host:9000/metrics"),
             ("prometheus_port", "9100"),
             ("enable_metrics", "true"),
         ]);
         derive_grpc_metrics_url(&mut labels, "grpc://host:30001");
         assert_eq!(
             labels.get("metrics_url").map(String::as_str),
-            Some("http://sidecar:9000/metrics")
+            Some("http://host:9000/metrics")
         );
         // Transient derivation keys are consumed.
         assert!(!labels.contains_key("prometheus_port"));
         assert!(!labels.contains_key("enable_metrics"));
+    }
+
+    #[test]
+    fn derive_grpc_metrics_url_rejects_explicit_on_foreign_host() {
+        // A backend-advertised metrics_url pointing at a different host is an
+        // SSRF vector; it must be dropped and the derived endpoint used instead.
+        let mut labels = labels_of(&[
+            ("metrics_url", "http://evil.example.com:9000/metrics"),
+            ("prometheus_port", "9100"),
+        ]);
+        derive_grpc_metrics_url(&mut labels, "grpc://host:30001");
+        assert_eq!(
+            labels.get("metrics_url").map(String::as_str),
+            Some("http://host:9100/metrics")
+        );
+    }
+
+    #[test]
+    fn derive_grpc_metrics_url_drops_foreign_explicit_without_fallback() {
+        // No derivable fallback: a foreign explicit URL is removed entirely
+        // rather than scraped.
+        let mut labels = labels_of(&[("metrics_url", "http://evil.example.com:9000/metrics")]);
+        derive_grpc_metrics_url(&mut labels, "grpc://host:30001");
+        assert!(!labels.contains_key("metrics_url"));
     }
 
     #[test]
@@ -585,12 +640,33 @@ mod tests {
 
     #[test]
     fn derive_grpc_metrics_url_ipv6_host_from_grpc_url() {
-        // IPv6 gRPC host must round-trip without brackets in the scrape URL host.
+        // An IPv6 gRPC host must stay bracketed in the scrape URL authority
+        // (`http://[::1]:9100/metrics`), otherwise the target is an invalid URI.
         let mut labels = labels_of(&[("prometheus_port", "9100")]);
         derive_grpc_metrics_url(&mut labels, "grpc://[::1]:30001");
         assert_eq!(
             labels.get("metrics_url").map(String::as_str),
-            Some("http://::1:9100/metrics")
+            Some("http://[::1]:9100/metrics")
+        );
+
+        // Same for the enable_metrics + port branch.
+        let mut labels = labels_of(&[("enable_metrics", "true"), ("port", "30000")]);
+        derive_grpc_metrics_url(&mut labels, "grpc://[2001:db8::1]:30001");
+        assert_eq!(
+            labels.get("metrics_url").map(String::as_str),
+            Some("http://[2001:db8::1]:30000/metrics")
+        );
+    }
+
+    #[test]
+    fn derive_grpc_metrics_url_accepts_explicit_ipv6_same_host() {
+        // Explicit metrics_url on the same IPv6 host (brackets vs. grpc_host's
+        // unbracketed form must still compare equal) is trusted.
+        let mut labels = labels_of(&[("metrics_url", "http://[::1]:9100/metrics")]);
+        derive_grpc_metrics_url(&mut labels, "grpc://[::1]:30001");
+        assert_eq!(
+            labels.get("metrics_url").map(String::as_str),
+            Some("http://[::1]:9100/metrics")
         );
     }
 

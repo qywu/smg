@@ -48,6 +48,21 @@ pub const MOONCAKE_CONNECTOR: &str = "MooncakeConnector";
 /// vLLM NIXL KV connector name
 pub const NIXL_CONNECTOR: &str = "NixlConnector";
 
+/// Format `host:port` into a URL authority, bracketing the host when it is a
+/// bare IPv6 literal.
+///
+/// IPv6 address literals must be bracketed in an HTTP authority (RFC 3986), so
+/// `::1` becomes `[::1]:9100`; otherwise `reqwest`/`url` reject the target and
+/// the scrape silently fails. Hosts that are already bracketed or not IPv6
+/// (no `:`) pass through unchanged, so this is idempotent.
+pub(crate) fn metrics_authority(host: &str, port: &str) -> String {
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// POST an admin endpoint on an HTTP worker and map the outcome to a
 /// [`WorkerResult`].
 async fn admin_http_post(
@@ -708,7 +723,7 @@ impl WorkerMetadata {
         if host.is_empty() {
             return None;
         }
-        Some(format!("http://{host}:{port}/metrics"))
+        Some(format!("http://{}/metrics", metrics_authority(host, port)))
     }
 
     // ── DP awareness ────────────────────────────────────────────────
@@ -2394,5 +2409,35 @@ mod tests {
         assert!(worker.supports_model("text-embedding-3-small"));
         assert!(!worker.supports_model("non-existent-model"));
         assert!(worker.has_models_discovered());
+    }
+
+    #[test]
+    fn test_metrics_authority_brackets_bare_ipv6() {
+        assert_eq!(metrics_authority("::1", "9100"), "[::1]:9100");
+        assert_eq!(
+            metrics_authority("2001:db8::1", "9100"),
+            "[2001:db8::1]:9100"
+        );
+        // Already bracketed and non-IPv6 hosts pass through (idempotent).
+        assert_eq!(metrics_authority("[::1]", "9100"), "[::1]:9100");
+        assert_eq!(metrics_authority("10.0.0.5", "9100"), "10.0.0.5:9100");
+        assert_eq!(metrics_authority("node-7", "9100"), "node-7:9100");
+    }
+
+    #[test]
+    fn test_grpc_metrics_url_ipv6_fallback_is_bracketed() {
+        use crate::worker::BasicWorkerBuilder;
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("prometheus_port".to_string(), "9100".to_string());
+        let worker = BasicWorkerBuilder::new("grpc://[::1]:30001")
+            .connection_mode(ConnectionMode::Grpc)
+            .labels(labels)
+            .build();
+        // The prometheus_port fallback must keep the IPv6 host bracketed so the
+        // scrape URL is a valid authority.
+        assert_eq!(
+            worker.metrics_url().as_deref(),
+            Some("http://[::1]:9100/metrics")
+        );
     }
 }
