@@ -699,8 +699,15 @@ impl WorkerMetadata {
         if let Some(url) = labels.get("metrics_url").filter(|s| !s.is_empty()) {
             return Some(url.clone());
         }
+        // Discovery sets an explicit `metrics_url` whenever one is derivable, so
+        // this is a fallback for workers configured out-of-band. Use the worker's
+        // own URL host (`bootstrap_host`, parsed from `spec.url`); skip when it's
+        // empty rather than emitting a hostless scrape target.
         let port = labels.get("prometheus_port").filter(|s| !s.is_empty())?;
-        let host = &self.spec.bootstrap_host;
+        let host = self.spec.bootstrap_host.as_str();
+        if host.is_empty() {
+            return None;
+        }
         Some(format!("http://{host}:{port}/metrics"))
     }
 

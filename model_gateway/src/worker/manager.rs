@@ -49,8 +49,11 @@ struct ScrapeResponse {
     /// endpoint so gRPC workers are labelled by their gRPC address.
     url: String,
     connection_mode: &'static str,
-    /// `None` when the worker has no known scrape endpoint (skipped).
-    result: Option<Result<reqwest::Response, reqwest::Error>>,
+    /// Outer `None`: no known scrape endpoint (skipped). `Some(None)`: the
+    /// fetch or body read failed, or the response was non-2xx. `Some(Some(_))`:
+    /// the response body. The body is read inside the per-worker future so
+    /// downloads run concurrently rather than serialized in the consumer.
+    result: Option<Option<String>>,
 }
 
 /// Fan out engine `/metrics` scrapes in parallel.
@@ -85,10 +88,14 @@ async fn scrape_engine_metrics(
                 if let Some(key) = api_key {
                     req = req.bearer_auth(key);
                 }
+                let body = match req.send().await {
+                    Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
+                    _ => None,
+                };
                 ScrapeResponse {
                     url,
                     connection_mode,
-                    result: Some(req.send().await),
+                    result: Some(body),
                 }
             }
         })
@@ -1006,17 +1013,13 @@ impl WorkerManager {
         let mut metric_packs = Vec::new();
         let mut skipped = 0usize;
         for resp in responses {
-            let Some(result) = resp.result else {
+            let Some(text) = resp.result else {
                 skipped += 1;
                 Metrics::record_engine_metrics_scrape(
                     resp.connection_mode,
                     metrics_labels::RESULT_SKIPPED,
                 );
                 continue;
-            };
-            let text = match result {
-                Ok(r) if r.status().is_success() => r.text().await.ok(),
-                _ => None,
             };
             match text {
                 Some(text) => {
@@ -1040,7 +1043,10 @@ impl WorkerManager {
             let msg = if skipped == workers.len() {
                 "No workers expose a metrics endpoint".to_string()
             } else {
-                "All backend requests failed".to_string()
+                let attempted = workers.len() - skipped;
+                format!(
+                    "All {attempted} scrape request(s) failed ({skipped} worker(s) skipped — no metrics endpoint)"
+                )
             };
             return EngineMetricsResult::Err(msg);
         }

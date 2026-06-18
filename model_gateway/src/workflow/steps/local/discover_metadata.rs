@@ -267,10 +267,15 @@ async fn fetch_grpc_metadata(
 /// 2. `prometheus_port` (+ gRPC host),
 /// 3. derived `http://{host}:{port}/metrics` — only when an `enable_metrics`
 ///    flag is truthy, so a dark port is never advertised.
+///
+/// The host always comes from the gRPC worker URL, never from the `server_args`
+/// `host` (which is the bind address — often `0.0.0.0`/`::`/empty — and not a
+/// routable scrape target). This keeps the scrape and its bearer token on the
+/// worker's own host. The `host` key is consumed but not used.
 fn derive_grpc_metrics_url(labels: &mut HashMap<String, String>, grpc_url: &str) {
     let enable_metrics = labels.remove("enable_metrics");
     let prometheus_port = labels.remove("prometheus_port").filter(|s| !s.is_empty());
-    let host = labels.remove("host").filter(|s| !s.is_empty());
+    labels.remove("host");
     let port = labels.remove("port").filter(|s| !s.is_empty());
 
     let explicit = labels.get("metrics_url").filter(|s| !s.is_empty()).cloned();
@@ -278,13 +283,13 @@ fn derive_grpc_metrics_url(labels: &mut HashMap<String, String>, grpc_url: &str)
     let resolved = explicit
         .or_else(|| {
             prometheus_port.map(|p| {
-                let h = host.clone().unwrap_or_else(|| grpc_host(grpc_url));
+                let h = grpc_host(grpc_url);
                 format!("http://{h}:{p}/metrics")
             })
         })
         .or_else(|| {
             (is_truthy(enable_metrics.as_deref()) && port.is_some()).then(|| {
-                let h = host.unwrap_or_else(|| grpc_host(grpc_url));
+                let h = grpc_host(grpc_url);
                 let p = port.unwrap_or_default();
                 format!("http://{h}:{p}/metrics")
             })
@@ -309,17 +314,19 @@ fn is_truthy(value: Option<&str>) -> bool {
     )
 }
 
-/// Host portion of a gRPC URL (`grpc://host:port` → `host`), falling back to the
-/// stripped input.
+/// Host portion of a gRPC URL (`grpc://host:port` → `host`,
+/// `grpc://[::1]:port` → `::1`), falling back to the stripped input.
 fn grpc_host(grpc_url: &str) -> String {
     let stripped = grpc_url
         .strip_prefix("grpc://")
         .or_else(|| grpc_url.strip_prefix("grpcs://"))
         .unwrap_or(grpc_url);
-    stripped
-        .split_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(stripped)
+    // `rsplit_once` keeps bracketed IPv6 literals intact (`[::1]:port`); a
+    // plain `split_once(':')` would cut at the first colon of the address.
+    let host = stripped.rsplit_once(':').map_or(stripped, |(h, _)| h);
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
         .to_string()
 }
 
@@ -562,15 +569,28 @@ mod tests {
 
     #[test]
     fn derive_grpc_metrics_url_derives_when_enabled() {
+        // The bind `host` (often a wildcard) is dropped; the scrape host comes
+        // from the worker's gRPC URL so the endpoint is routable.
         let mut labels = labels_of(&[
             ("enable_metrics", "true"),
             ("host", "0.0.0.0"),
             ("port", "30000"),
         ]);
-        derive_grpc_metrics_url(&mut labels, "grpc://host:30001");
+        derive_grpc_metrics_url(&mut labels, "grpc://node-7:30001");
         assert_eq!(
             labels.get("metrics_url").map(String::as_str),
-            Some("http://0.0.0.0:30000/metrics")
+            Some("http://node-7:30000/metrics")
+        );
+    }
+
+    #[test]
+    fn derive_grpc_metrics_url_ipv6_host_from_grpc_url() {
+        // IPv6 gRPC host must round-trip without brackets in the scrape URL host.
+        let mut labels = labels_of(&[("prometheus_port", "9100")]);
+        derive_grpc_metrics_url(&mut labels, "grpc://[::1]:30001");
+        assert_eq!(
+            labels.get("metrics_url").map(String::as_str),
+            Some("http://::1:9100/metrics")
         );
     }
 

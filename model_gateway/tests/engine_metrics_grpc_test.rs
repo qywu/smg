@@ -5,7 +5,7 @@
 //! stub HTTP `/metrics` server, register a gRPC-mode worker pointing at it, and
 //! assert the worker's series merge into the aggregated `/engine_metrics` output.
 
-use std::{collections::HashMap, net::TcpListener, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{response::IntoResponse, routing::get, Router};
 use smg::worker::{
@@ -29,16 +29,16 @@ impl StubMetricsServer {
         reason = "test infrastructure - panicking on setup failure is intentional"
     )]
     async fn start(body: &'static str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub metrics server");
+        // Bind once and serve the same listener: reading the port and rebinding
+        // would race another process onto it between the two binds.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub metrics server");
         let port = listener.local_addr().expect("local addr").port();
-        drop(listener);
 
         let app = Router::new().route("/metrics", get(move || async move { body.into_response() }));
         let (tx, rx) = oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                .await
-                .expect("bind stub listener");
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     let _ = rx.await;
@@ -46,7 +46,6 @@ impl StubMetricsServer {
                 .await
                 .expect("stub server");
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         Self {
             url: format!("http://127.0.0.1:{port}"),
